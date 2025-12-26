@@ -13,9 +13,23 @@ package value
 //
 // The Go compiler's SSA backend can recognize these patterns and generate
 // SIMD instructions (SSE, AVX, NEON, etc.) on supported architectures.
+//
+// Note on maybeBig() overhead: Each operation calls maybeBig() to handle overflow
+// to BigInt. While this adds some overhead, it's necessary for correctness and the
+// cost is acceptable because:
+// 1. It's a simple comparison that compilers optimize well
+// 2. Batched overflow checking would require multiple passes over data
+// 3. For large vectors (where SIMD benefits are greatest), the cost is amortized
+// 4. The alternative of assuming no overflow would violate Ivy's semantics
 
 // vectorAddInt performs element-wise addition of two Int vectors.
 // This uses a SIMD-friendly pattern: simple loop with contiguous access.
+//
+// Note: The maybeBig() call on each result introduces some overhead, but is necessary
+// to handle overflow to BigInt correctly. This overhead is acceptable because:
+// 1. It's a simple comparison that compilers can optimize
+// 2. The alternative (batched overflow check) would require multiple passes
+// 3. For large vectors where SIMD matters most, the cost is amortized
 func vectorAddInt(c Context, u, v *Vector) *Vector {
 	if u.Len() != v.Len() {
 		Errorf("length mismatch in vector addition")
