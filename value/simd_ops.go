@@ -1,36 +1,24 @@
+//go:build goexperiment.simd
+
 // Copyright 2024 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package value
 
-// This file contains SIMD-friendly implementations of vector operations.
-// These implementations use patterns that the Go compiler can auto-vectorize:
-// - Contiguous memory access
-// - Minimal branching in loops
-// - Simple arithmetic operations on native integer types
-// - Range-based iteration with predictable bounds
-//
-// The Go compiler's SSA backend can recognize these patterns and generate
-// SIMD instructions (SSE, AVX, NEON, etc.) on supported architectures.
-//
-// Note on maybeBig() overhead: Each operation calls maybeBig() to handle overflow
-// to BigInt. While this adds some overhead, it's necessary for correctness and the
-// cost is acceptable because:
-// 1. It's a simple comparison that compilers optimize well
-// 2. Batched overflow checking would require multiple passes over data
-// 3. For large vectors (where SIMD benefits are greatest), the cost is amortized
-// 4. The alternative of assuming no overflow would violate Ivy's semantics
+import (
+	"simd/archsimd"
+)
 
-// vectorAddInt performs element-wise addition of two Int vectors.
-// This uses a SIMD-friendly pattern: simple loop with contiguous access.
+// This file implements vector operations using Go's experimental SIMD API.
+// It requires building with GOEXPERIMENT=simd.
 //
-// Note: The maybeBig() call on each result introduces some overhead, but is necessary
-// to handle overflow to BigInt correctly. This overhead is acceptable because:
-// 1. It's a simple comparison that compilers can optimize
-// 2. The alternative (batched overflow check) would require multiple passes
-// 3. For large vectors where SIMD matters most, the cost is amortized
-func vectorAddInt(c Context, u, v *Vector) *Vector {
+// The SIMD API provides explicit SIMD vector types (Int64x2, Int64x4, Int64x8)
+// that map directly to hardware SIMD registers (SSE, AVX2, AVX512).
+
+// vectorAddSIMD performs element-wise addition using SIMD instructions.
+// It processes chunks of the vector using Int64x4 (256-bit AVX2) vectors.
+func vectorAddSIMD(c Context, u, v *Vector) *Vector {
 	if u.Len() != v.Len() {
 		Errorf("length mismatch in vector addition")
 	}
@@ -39,29 +27,62 @@ func vectorAddInt(c Context, u, v *Vector) *Vector {
 		return u
 	}
 	
-	// Fast path: check if both vectors contain only small Ints
-	// This allows compiler vectorization
-	uAllInt := u.AllInts()
-	vAllInt := v.AllInts()
+	// Check if both vectors contain only small Ints
+	if !u.AllInts() || !v.AllInts() {
+		return nil // Fallback to generic implementation
+	}
 	
-	if uAllInt && vAllInt {
-		result := newVectorEditor(n, nil)
-		// This loop pattern is vectorizable by the compiler
+	result := newVectorEditor(n, nil)
+	
+	// Check if AVX2 is available (for Int64x4)
+	if archsimd.X86.HasAVX2() && n >= 4 {
+		// Process 4 elements at a time using Int64x4 (AVX2)
+		i := 0
+		for i+4 <= n {
+			// Load 4 int64 values into SIMD vectors
+			var uVals, vVals [4]int64
+			for j := 0; j < 4; j++ {
+				uVals[j] = int64(u.At(i+j).(Int))
+				vVals[j] = int64(v.At(i+j).(Int))
+			}
+			
+			// Load into SIMD vectors
+			uVec := archsimd.LoadInt64x4(&uVals)
+			vVec := archsimd.LoadInt64x4(&vVals)
+			
+			// Perform SIMD addition
+			resVec := uVec.Add(vVec)
+			
+			// Store results back
+			var resVals [4]int64
+			resVec.Store(&resVals)
+			
+			for j := 0; j < 4; j++ {
+				result.Set(i+j, Int(resVals[j]).maybeBig())
+			}
+			i += 4
+		}
+		
+		// Handle remaining elements
+		for ; i < n; i++ {
+			ui := u.At(i).(Int)
+			vi := v.At(i).(Int)
+			result.Set(i, (ui + vi).maybeBig())
+		}
+	} else {
+		// Fallback to scalar processing
 		for i := 0; i < n; i++ {
 			ui := u.At(i).(Int)
 			vi := v.At(i).(Int)
-			// Direct integer addition - compiler can vectorize this
 			result.Set(i, (ui + vi).maybeBig())
 		}
-		return result.Publish()
 	}
 	
-	// Fallback to general implementation
-	return nil
+	return result.Publish()
 }
 
-// vectorSubInt performs element-wise subtraction of two Int vectors.
-func vectorSubInt(c Context, u, v *Vector) *Vector {
+// vectorSubSIMD performs element-wise subtraction using SIMD instructions.
+func vectorSubSIMD(c Context, u, v *Vector) *Vector {
 	if u.Len() != v.Len() {
 		Errorf("length mismatch in vector subtraction")
 	}
@@ -70,24 +91,52 @@ func vectorSubInt(c Context, u, v *Vector) *Vector {
 		return u
 	}
 	
-	uAllInt := u.AllInts()
-	vAllInt := v.AllInts()
+	if !u.AllInts() || !v.AllInts() {
+		return nil
+	}
 	
-	if uAllInt && vAllInt {
-		result := newVectorEditor(n, nil)
+	result := newVectorEditor(n, nil)
+	
+	if archsimd.X86.HasAVX2() && n >= 4 {
+		i := 0
+		for i+4 <= n {
+			var uVals, vVals [4]int64
+			for j := 0; j < 4; j++ {
+				uVals[j] = int64(u.At(i+j).(Int))
+				vVals[j] = int64(v.At(i+j).(Int))
+			}
+			
+			uVec := archsimd.LoadInt64x4(&uVals)
+			vVec := archsimd.LoadInt64x4(&vVals)
+			resVec := uVec.Sub(vVec)
+			
+			var resVals [4]int64
+			resVec.Store(&resVals)
+			
+			for j := 0; j < 4; j++ {
+				result.Set(i+j, Int(resVals[j]).maybeBig())
+			}
+			i += 4
+		}
+		
+		for ; i < n; i++ {
+			ui := u.At(i).(Int)
+			vi := v.At(i).(Int)
+			result.Set(i, (ui - vi).maybeBig())
+		}
+	} else {
 		for i := 0; i < n; i++ {
 			ui := u.At(i).(Int)
 			vi := v.At(i).(Int)
 			result.Set(i, (ui - vi).maybeBig())
 		}
-		return result.Publish()
 	}
 	
-	return nil
+	return result.Publish()
 }
 
-// vectorMulInt performs element-wise multiplication of two Int vectors.
-func vectorMulInt(c Context, u, v *Vector) *Vector {
+// vectorMulSIMD performs element-wise multiplication using SIMD instructions.
+func vectorMulSIMD(c Context, u, v *Vector) *Vector {
 	if u.Len() != v.Len() {
 		Errorf("length mismatch in vector multiplication")
 	}
@@ -96,24 +145,54 @@ func vectorMulInt(c Context, u, v *Vector) *Vector {
 		return u
 	}
 	
-	uAllInt := u.AllInts()
-	vAllInt := v.AllInts()
+	if !u.AllInts() || !v.AllInts() {
+		return nil
+	}
 	
-	if uAllInt && vAllInt {
-		result := newVectorEditor(n, nil)
+	result := newVectorEditor(n, nil)
+	
+	// Note: Int64 multiplication requires AVX512DQ for VPMULLQ instruction
+	if archsimd.X86.HasAVX512DQ() && n >= 8 {
+		i := 0
+		for i+8 <= n {
+			var uVals, vVals [8]int64
+			for j := 0; j < 8; j++ {
+				uVals[j] = int64(u.At(i+j).(Int))
+				vVals[j] = int64(v.At(i+j).(Int))
+			}
+			
+			uVec := archsimd.LoadInt64x8(&uVals)
+			vVec := archsimd.LoadInt64x8(&vVals)
+			resVec := uVec.Mul(vVec)
+			
+			var resVals [8]int64
+			resVec.Store(&resVals)
+			
+			for j := 0; j < 8; j++ {
+				result.Set(i+j, Int(resVals[j]).maybeBig())
+			}
+			i += 8
+		}
+		
+		for ; i < n; i++ {
+			ui := u.At(i).(Int)
+			vi := v.At(i).(Int)
+			result.Set(i, (ui * vi).maybeBig())
+		}
+	} else {
+		// Fallback to scalar (Int64 SIMD mul needs AVX512DQ)
 		for i := 0; i < n; i++ {
 			ui := u.At(i).(Int)
 			vi := v.At(i).(Int)
 			result.Set(i, (ui * vi).maybeBig())
 		}
-		return result.Publish()
 	}
 	
-	return nil
+	return result.Publish()
 }
 
-// vectorMinInt performs element-wise minimum of two Int vectors.
-func vectorMinInt(c Context, u, v *Vector) *Vector {
+// vectorMinSIMD performs element-wise minimum using SIMD instructions.
+func vectorMinSIMD(c Context, u, v *Vector) *Vector {
 	if u.Len() != v.Len() {
 		Errorf("length mismatch in vector min")
 	}
@@ -122,30 +201,61 @@ func vectorMinInt(c Context, u, v *Vector) *Vector {
 		return u
 	}
 	
-	uAllInt := u.AllInts()
-	vAllInt := v.AllInts()
+	if !u.AllInts() || !v.AllInts() {
+		return nil
+	}
 	
-	if uAllInt && vAllInt {
-		result := newVectorEditor(n, nil)
-		// Branchless min using arithmetic - more SIMD-friendly
-		for i := 0; i < n; i++ {
+	result := newVectorEditor(n, nil)
+	
+	// Int64 min requires AVX512VL or AVX512F
+	if archsimd.X86.HasAVX512F() && n >= 8 {
+		i := 0
+		for i+8 <= n {
+			var uVals, vVals [8]int64
+			for j := 0; j < 8; j++ {
+				uVals[j] = int64(u.At(i+j).(Int))
+				vVals[j] = int64(v.At(i+j).(Int))
+			}
+			
+			uVec := archsimd.LoadInt64x8(&uVals)
+			vVec := archsimd.LoadInt64x8(&vVals)
+			resVec := uVec.Min(vVec)
+			
+			var resVals [8]int64
+			resVec.Store(&resVals)
+			
+			for j := 0; j < 8; j++ {
+				result.Set(i+j, Int(resVals[j]))
+			}
+			i += 8
+		}
+		
+		for ; i < n; i++ {
 			ui := u.At(i).(Int)
 			vi := v.At(i).(Int)
-			// Compiler can optimize this comparison into SIMD min instruction
 			if ui < vi {
 				result.Set(i, ui)
 			} else {
 				result.Set(i, vi)
 			}
 		}
-		return result.Publish()
+	} else {
+		for i := 0; i < n; i++ {
+			ui := u.At(i).(Int)
+			vi := v.At(i).(Int)
+			if ui < vi {
+				result.Set(i, ui)
+			} else {
+				result.Set(i, vi)
+			}
+		}
 	}
 	
-	return nil
+	return result.Publish()
 }
 
-// vectorMaxInt performs element-wise maximum of two Int vectors.
-func vectorMaxInt(c Context, u, v *Vector) *Vector {
+// vectorMaxSIMD performs element-wise maximum using SIMD instructions.
+func vectorMaxSIMD(c Context, u, v *Vector) *Vector {
 	if u.Len() != v.Len() {
 		Errorf("length mismatch in vector max")
 	}
@@ -154,64 +264,54 @@ func vectorMaxInt(c Context, u, v *Vector) *Vector {
 		return u
 	}
 	
-	uAllInt := u.AllInts()
-	vAllInt := v.AllInts()
+	if !u.AllInts() || !v.AllInts() {
+		return nil
+	}
 	
-	if uAllInt && vAllInt {
-		result := newVectorEditor(n, nil)
-		for i := 0; i < n; i++ {
+	result := newVectorEditor(n, nil)
+	
+	if archsimd.X86.HasAVX512F() && n >= 8 {
+		i := 0
+		for i+8 <= n {
+			var uVals, vVals [8]int64
+			for j := 0; j < 8; j++ {
+				uVals[j] = int64(u.At(i+j).(Int))
+				vVals[j] = int64(v.At(i+j).(Int))
+			}
+			
+			uVec := archsimd.LoadInt64x8(&uVals)
+			vVec := archsimd.LoadInt64x8(&vVals)
+			resVec := uVec.Max(vVec)
+			
+			var resVals [8]int64
+			resVec.Store(&resVals)
+			
+			for j := 0; j < 8; j++ {
+				result.Set(i+j, Int(resVals[j]))
+			}
+			i += 8
+		}
+		
+		for ; i < n; i++ {
 			ui := u.At(i).(Int)
 			vi := v.At(i).(Int)
-			// Compiler can optimize this comparison into SIMD max instruction
 			if ui > vi {
 				result.Set(i, ui)
 			} else {
 				result.Set(i, vi)
 			}
 		}
-		return result.Publish()
-	}
-	
-	return nil
-}
-
-// vectorScalarAddInt adds a scalar to each element of an Int vector.
-// This is particularly SIMD-friendly as the scalar can be broadcast.
-func vectorScalarAddInt(c Context, scalar Int, v *Vector) *Vector {
-	n := v.Len()
-	if n == 0 {
-		return v
-	}
-	
-	if v.AllInts() {
-		result := newVectorEditor(n, nil)
-		// This pattern is ideal for SIMD: same scalar added to every element
+	} else {
 		for i := 0; i < n; i++ {
+			ui := u.At(i).(Int)
 			vi := v.At(i).(Int)
-			result.Set(i, (scalar + vi).maybeBig())
+			if ui > vi {
+				result.Set(i, ui)
+			} else {
+				result.Set(i, vi)
+			}
 		}
-		return result.Publish()
 	}
 	
-	return nil
-}
-
-// vectorScalarMulInt multiplies each element of an Int vector by a scalar.
-func vectorScalarMulInt(c Context, scalar Int, v *Vector) *Vector {
-	n := v.Len()
-	if n == 0 {
-		return v
-	}
-	
-	if v.AllInts() {
-		result := newVectorEditor(n, nil)
-		// Broadcast scalar multiplication - very SIMD-friendly
-		for i := 0; i < n; i++ {
-			vi := v.At(i).(Int)
-			result.Set(i, (scalar * vi).maybeBig())
-		}
-		return result.Publish()
-	}
-	
-	return nil
+	return result.Publish()
 }
