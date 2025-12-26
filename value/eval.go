@@ -674,6 +674,59 @@ func unaryMatrixOp(c Context, op string, i Value) Value {
 // binaryVectorOp applies op elementwise to i and j.
 func binaryVectorOp(c Context, i Value, op string, j Value) Value {
 	u, v := i.(*Vector), j.(*Vector)
+	
+	// Try SIMD-friendly optimized implementations for common operations
+	// These work when both vectors contain only Int values
+	if u.Len() == v.Len() && u.Len() > 0 {
+		var result *Vector
+		switch op {
+		case "+":
+			result = vectorAddInt(c, u, v)
+		case "-":
+			result = vectorSubInt(c, u, v)
+		case "*":
+			result = vectorMulInt(c, u, v)
+		case "min":
+			result = vectorMinInt(c, u, v)
+		case "max":
+			result = vectorMaxInt(c, u, v)
+		}
+		if result != nil {
+			return result
+		}
+	}
+	
+	// Handle scalar-vector operations with SIMD optimization
+	if u.Len() == 1 && v.Len() > 0 {
+		if scalar, ok := u.At(0).(Int); ok && v.AllInts() {
+			switch op {
+			case "+":
+				if result := vectorScalarAddInt(c, scalar, v); result != nil {
+					return result
+				}
+			case "*":
+				if result := vectorScalarMulInt(c, scalar, v); result != nil {
+					return result
+				}
+			}
+		}
+	}
+	if v.Len() == 1 && u.Len() > 0 {
+		if scalar, ok := v.At(0).(Int); ok && u.AllInts() {
+			switch op {
+			case "+":
+				if result := vectorScalarAddInt(c, scalar, u); result != nil {
+					return result
+				}
+			case "*":
+				if result := vectorScalarMulInt(c, scalar, u); result != nil {
+					return result
+				}
+			}
+		}
+	}
+	
+	// Fallback to original implementation
 	if u.Len() == 1 {
 		n := newVectorEditor(v.Len(), nil)
 		pfor(safeBinary(op), 1, n.Len(), func(lo, hi int) {
